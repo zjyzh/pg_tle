@@ -31,6 +31,8 @@
 ### 17. Malformed strings cannot be used for SQL injection
 ### 18. pg_tle can be updated from 1.4.0 to 1.5.0 without affecting clientauth functions
 ### 19. application_name field works
+### 20. Nonexistent pgtle.clientauth_db_name does not lock users out (enable_clientauth = 'on')
+### 21. Nonexistent pgtle.clientauth_db_name returns a clear error (enable_clientauth = 'require')
 
 use strict;
 use warnings;
@@ -360,6 +362,62 @@ $node->safe_psql('postgres', q[
 $node->psql('not_excluded', 'select', extra_params => ['-U', 'testuser'], stderr => \$psql_err);
 like($psql_err, qr/FATAL:  004_pg_tle_clientauth.pl/,
     "application_name field works on pg_tle 1.5.0");
+
+### 20. Nonexistent pgtle.clientauth_db_name does not lock users out
+###     (enable_clientauth = 'on')
+###
+### pgtle.clientauth_db_name is PGC_POSTMASTER, so at startup each
+### clientauth background worker tries to attach to whatever database
+### the GUC names. If that database does not exist,
+### BackgroundWorkerInitializeConnection() FATAL-exits the worker, the
+### postmaster respawns it once per second, and any client's
+### ClientAuthentication_hook waits on a shared-memory rendezvous that
+### never completes. clientauth_hook must short-circuit before
+### enqueuing: with 'on', accept the connection (matches the "pg_tle
+### extension not installed on clientauth_db_name" fallback in
+### can_allow_without_executing()).
+$node->append_conf('postgresql.conf', qq(pgtle.clientauth_users_to_skip = ''));
+$node->append_conf('postgresql.conf', qq(pgtle.clientauth_databases_to_skip = ''));
+$node->append_conf('postgresql.conf', qq(pgtle.enable_clientauth = 'on'));
+$node->append_conf('postgresql.conf', qq(pgtle.clientauth_db_name = 'ghost_clientauth_db_does_not_exist'));
+$node->restart;
+
+# Bounded timeout so a regression that reintroduces the hang is caught
+# deterministically as a failure rather than stalling the test run.
+my $missing_db_out = '';
+my $missing_db_err = '';
+my $missing_db_rc = $node->psql(
+    'postgres', 'SELECT 1',
+    stdout => \$missing_db_out,
+    stderr => \$missing_db_err,
+    timeout => 15,
+);
+is($missing_db_rc, 0,
+    "enable_clientauth=on: nonexistent clientauth_db_name still allows connections");
+like($missing_db_out, qr/^1$/,
+    "enable_clientauth=on: client backend actually executes the query");
+
+### 21. Nonexistent pgtle.clientauth_db_name returns a clear error under
+###     enable_clientauth = 'require' (matches the semantics of the
+###     "pg_tle extension not installed on clientauth_db_name" reject
+###     fallback in can_reject_without_executing()).
+$node->append_conf('postgresql.conf', qq(pgtle.enable_clientauth = 'require'));
+$node->restart;
+
+my $require_err = '';
+$node->psql(
+    'postgres', 'SELECT 1',
+    stderr => \$require_err,
+    timeout => 15,
+);
+like($require_err,
+    qr/FATAL:  pgtle\.enable_clientauth is set to require, but the clientauth background workers are not running/,
+    "enable_clientauth=require: nonexistent clientauth_db_name rejects with actionable error");
+
+# Restore a valid clientauth_db_name so the trailing $node->stop is clean.
+$node->append_conf('postgresql.conf', qq(pgtle.enable_clientauth = 'on'));
+$node->append_conf('postgresql.conf', qq(pgtle.clientauth_db_name = 'postgres'));
+$node->restart;
 
 $node->stop;
 done_testing();

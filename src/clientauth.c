@@ -96,6 +96,8 @@
  * user function
  */
 #define CLIENT_AUTH_USER_ERROR_MAX_STRLEN 256
+/* How long clientauth_hook() waits for a worker to attach before falling back. */
+#define CLIENTAUTH_WORKER_READY_TIMEOUT_MS 3000
 
 /*
  * Fixed-length subset of Port, passed to user function. A corresponding SQL
@@ -188,6 +190,17 @@ typedef struct ClientAuthBgwShmemSharedState
 
 	/* Connection queue state */
 	ClientAuthStatusEntry requests[CLIENT_AUTH_MAX_PENDING_ENTRIES];
+
+	/*
+	 * Count of workers that have completed BackgroundWorkerInitializeConnection()
+	 * at least once. clientauth_hook() consults this before enqueuing so it can
+	 * fall back safely when workers never attach (e.g. clientauth_db_name names
+	 * a nonexistent database). We can't check pg_database from the hook itself
+	 * because it runs before InitPostgres, so SysCache lookups on per-database
+	 * catalogs fail; publishing from the worker sidesteps that.
+	 */
+	int			workers_ready;
+	ConditionVariable workers_ready_cv;
 }			ClientAuthBgwShmemSharedState;
 
 static const char *clientauth_shmem_name = "pgtle_clientauth";
@@ -212,6 +225,7 @@ static void clientauth_shmem_request(void);
 /* Helper functions */
 static Size clientauth_shared_memsize(void);
 static void clientauth_sighup(SIGNAL_ARGS);
+static bool wait_for_clientauth_workers_ready(void);
 
 void		clientauth_init(void);
 static bool can_allow_without_executing(void);
@@ -377,6 +391,12 @@ clientauth_launcher_main(Datum arg)
 	/* Initialize connection to the database */
 	BackgroundWorkerInitializeConnection(clientauth_database_name, NULL, 0);
 
+	/* Publish worker readiness (see workers_ready on ClientAuthBgwShmemSharedState). */
+	LWLockAcquire(clientauth_ss->lock, LW_EXCLUSIVE);
+	clientauth_ss->workers_ready++;
+	LWLockRelease(clientauth_ss->lock);
+	ConditionVariableBroadcast(&clientauth_ss->workers_ready_cv);
+
 	/* Main worker loop */
 	while (true)
 	{
@@ -519,8 +539,7 @@ clientauth_launcher_main(Datum arg)
 	}
 }
 
-/*
- * Run the user's functions.
+/* Run the user's functions.
  *
  * This procedure should not do any transaction management (other than opening an SPI connection)
  * or shared memory accesses.
@@ -653,6 +672,25 @@ clientauth_hook(Port *port, int status)
 	/* Skip if this database is on the skip list */
 	if (check_string_in_guc_list(port->database_name, clientauth_databases_to_skip, "pgtle.clientauth_databases_to_skip"))
 		return;
+
+	/* Don't enqueue if workers never attached (e.g. bad clientauth_db_name). */
+	if (!wait_for_clientauth_workers_ready())
+	{
+		ereport(LOG,
+				errmsg("\"%s.clientauth\" background workers did not become ready within %d ms",
+					   PG_TLE_NSPNAME,
+					   CLIENTAUTH_WORKER_READY_TIMEOUT_MS),
+				errhint("Check that pgtle.clientauth_db_name (\"%s\") names an existing database and that max_worker_processes is large enough.",
+						clientauth_database_name));
+
+		if (enable_clientauth_feature == FEATURE_REQUIRE)
+			ereport(FATAL,
+					errcode(ERRCODE_CONNECTION_EXCEPTION),
+					errmsg("pgtle.enable_clientauth is set to require, but the clientauth background workers are not running"),
+					errhint("Check that pgtle.clientauth_db_name (\"%s\") names an existing database.",
+							clientauth_database_name));
+		return;
+	}
 
 	/*
 	 * If the queue entry is not available, wait until another client using it
@@ -789,6 +827,10 @@ clientauth_shmem_startup(void)
 			clientauth_ss->requests[i].done_processing = true;
 			clientauth_ss->requests[i].available_entry = true;
 		}
+
+		/* Worker-readiness gate (see workers_ready comment on struct). */
+		clientauth_ss->workers_ready = 0;
+		ConditionVariableInit(&clientauth_ss->workers_ready_cv);
 	}
 
 	LWLockRelease(AddinShmemInitLock);
@@ -824,6 +866,49 @@ clientauth_sighup(SIGNAL_ARGS)
 }
 
 /*
+ * Wait (bounded) for at least one background worker to attach to
+ * clientauth_db_name. Returns true if workers came up, false on timeout.
+ * See workers_ready on ClientAuthBgwShmemSharedState for why this exists.
+ */
+static bool
+wait_for_clientauth_workers_ready(void)
+{
+	TimestampTz deadline;
+	bool		workers_up;
+
+	LWLockAcquire(clientauth_ss->lock, LW_SHARED);
+	workers_up = clientauth_ss->workers_ready > 0;
+	LWLockRelease(clientauth_ss->lock);
+	if (workers_up)
+		return true;
+
+	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+										   CLIENTAUTH_WORKER_READY_TIMEOUT_MS);
+	ConditionVariablePrepareToSleep(&clientauth_ss->workers_ready_cv);
+	for (;;)
+	{
+		long		remaining_ms;
+
+		LWLockAcquire(clientauth_ss->lock, LW_SHARED);
+		workers_up = clientauth_ss->workers_ready > 0;
+		LWLockRelease(clientauth_ss->lock);
+		if (workers_up)
+			break;
+
+		remaining_ms = TimestampDifferenceMilliseconds(GetCurrentTimestamp(),
+													   deadline);
+		if (remaining_ms <= 0)
+			break;
+
+		(void) ConditionVariableTimedSleep(&clientauth_ss->workers_ready_cv,
+										   remaining_ms,
+										   WAIT_EVENT_MESSAGE_QUEUE_RECEIVE);
+	}
+	ConditionVariableCancelSleep();
+	return workers_up;
+}
+
+/*
  * If one (or more) of the following is true, then the connection can be
  * accepted without executing user functions.
  *
@@ -832,7 +917,7 @@ clientauth_sighup(SIGNAL_ARGS)
  * 3. pgtle.enable_clientauth is ON and no functions are registered with the clientauth feature
  */
 static bool
-can_allow_without_executing(void)
+can_allow_without_executing()
 {
 	List	   *proc_names;
 	Oid			extOid;
@@ -866,7 +951,7 @@ can_allow_without_executing(void)
  * 2. pgtle.enable_clientauth is REQUIRE and no functions are registered with the clientauth feature
  */
 static bool
-can_reject_without_executing(void)
+can_reject_without_executing()
 {
 	List	   *proc_names;
 	Oid			extOid;
